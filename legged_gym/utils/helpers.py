@@ -36,6 +36,23 @@ import random
 from isaacgym import gymapi
 from isaacgym import gymutil
 
+
+def _str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def _str_to_float_list(value):
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    return [float(item.strip()) for item in value.split(",") if item.strip()]
+
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 
 def class_to_dict(obj) -> dict:
@@ -127,12 +144,74 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
 def update_cfg_from_args(env_cfg, cfg_train, args):
     # seed
     if env_cfg is not None:
+        if args.seed is not None:
+            env_cfg.seed = args.seed
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
     if cfg_train is not None:
         if args.seed is not None:
             cfg_train.seed = args.seed
+        if args.use_drift is not None:
+            cfg_train.algorithm.use_drift = args.use_drift
+        if args.drift_model_warmup_updates is not None:
+            cfg_train.algorithm.drift_model_warmup_updates = args.drift_model_warmup_updates
+        if args.drift_actor_warmup_updates is not None:
+            cfg_train.algorithm.drift_actor_warmup_updates = args.drift_actor_warmup_updates
+        if args.drift_actor_loss_coef is not None:
+            cfg_train.algorithm.drift_actor_loss_coef = args.drift_actor_loss_coef
+        if args.positive_adv_threshold is not None:
+            cfg_train.algorithm.positive_adv_threshold = args.positive_adv_threshold
+        if args.min_positive_samples is not None:
+            cfg_train.algorithm.min_positive_samples = args.min_positive_samples
+        if args.use_top_positive_filter is not None:
+            cfg_train.algorithm.use_top_positive_filter = args.use_top_positive_filter
+        if args.positive_top_fraction is not None:
+            cfg_train.algorithm.positive_top_fraction = args.positive_top_fraction
+        if args.drift_step_size is not None:
+            cfg_train.algorithm.drift_step_size = args.drift_step_size
+        if args.max_drift_velocity_norm is not None:
+            cfg_train.algorithm.max_drift_velocity_norm = args.max_drift_velocity_norm
+        if args.max_drift_action_dist is not None:
+            cfg_train.algorithm.max_drift_action_dist = args.max_drift_action_dist
+        if args.drift_chunk_size is not None:
+            cfg_train.algorithm.drift_chunk_size = args.drift_chunk_size
+        if args.use_residual_drift is not None:
+            cfg_train.algorithm.use_residual_drift = args.use_residual_drift
+        if args.action_kernel_temperature is not None:
+            cfg_train.algorithm.action_kernel_temperature = args.action_kernel_temperature
+        if args.use_temperature_schedule is not None:
+            cfg_train.algorithm.use_temperature_schedule = args.use_temperature_schedule
+        if args.action_kernel_temperature_start is not None:
+            cfg_train.algorithm.action_kernel_temperature_start = args.action_kernel_temperature_start
+        if args.action_kernel_temperature_end is not None:
+            cfg_train.algorithm.action_kernel_temperature_end = args.action_kernel_temperature_end
+        if args.action_kernel_temperature_schedule_start is not None:
+            cfg_train.algorithm.action_kernel_temperature_schedule_start = args.action_kernel_temperature_schedule_start
+        if args.action_kernel_temperature_schedule_end is not None:
+            cfg_train.algorithm.action_kernel_temperature_schedule_end = args.action_kernel_temperature_schedule_end
+        if args.advantage_temperature is not None:
+            cfg_train.algorithm.advantage_temperature = args.advantage_temperature
+        if args.advantage_clip is not None:
+            cfg_train.algorithm.advantage_clip = args.advantage_clip
+        if args.use_state_kernel is not None:
+            cfg_train.algorithm.use_state_kernel = args.use_state_kernel
+        if args.state_kernel_temperature is not None:
+            cfg_train.algorithm.state_kernel_temperature = args.state_kernel_temperature
+        if args.state_feature_mode is not None:
+            cfg_train.algorithm.state_feature_mode = args.state_feature_mode
+        if args.use_multi_temperature is not None:
+            cfg_train.algorithm.use_multi_temperature = args.use_multi_temperature
+        if args.action_kernel_temperatures is not None:
+            cfg_train.algorithm.action_kernel_temperatures = args.action_kernel_temperatures
+        if args.normalize_drift_field is not None:
+            cfg_train.algorithm.normalize_drift_field = args.normalize_drift_field
+        if args.drift_field_norm_type is not None:
+            cfg_train.algorithm.drift_field_norm_type = args.drift_field_norm_type
+        if args.log_drift_debug is not None:
+            cfg_train.algorithm.log_drift_debug = args.log_drift_debug
+        if args.entropy_coef is not None:
+            cfg_train.algorithm.entropy_coef = args.entropy_coef
         # alg runner parameters
         if args.max_iterations is not None:
             cfg_train.runner.max_iterations = args.max_iterations
@@ -164,6 +243,36 @@ def get_args():
         {"name": "--num_envs", "type": int, "help": "Number of environments to create. Overrides config file if provided."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+        {"name": "--use_drift", "type": _str_to_bool, "default": None, "help": "Enable or disable drifting module. Use True or False."},
+        {"name": "--drift_model_warmup_updates", "type": int, "help": "Warmup updates before starting drift computation/logging."},
+        {"name": "--drift_actor_warmup_updates", "type": int, "help": "Warmup updates before enabling drift loss."},
+        {"name": "--drift_actor_loss_coef", "type": float, "help": "Weight of drift loss in PPO total loss."},
+        {"name": "--positive_adv_threshold", "type": float, "help": "Minimum raw advantage to count as positive sample."},
+        {"name": "--min_positive_samples", "type": int, "help": "Minimum number of positive samples required per minibatch."},
+        {"name": "--use_top_positive_filter", "type": _str_to_bool, "default": None, "help": "Use only the top raw-advantage positive samples for drift."},
+        {"name": "--positive_top_fraction", "type": float, "help": "Fraction of positive samples to keep when top-positive filtering is enabled."},
+        {"name": "--drift_step_size", "type": float, "help": "Step size from actor mean toward drift target."},
+        {"name": "--max_drift_velocity_norm", "type": float, "help": "Maximum norm of the drift field."},
+        {"name": "--max_drift_action_dist", "type": float, "help": "Maximum target distance from current actor mean."},
+        {"name": "--drift_chunk_size", "type": int, "help": "Rows per chunk for drift kernel computation. Lower this if drift causes CUDA OOM."},
+        {"name": "--use_residual_drift", "type": _str_to_bool, "default": None, "help": "Use positive residuals action-old_mu instead of absolute positive actions."},
+        {"name": "--action_kernel_temperature", "type": float, "help": "Temperature for action-space kernel."},
+        {"name": "--use_temperature_schedule", "type": _str_to_bool, "default": None, "help": "Linearly schedule action kernel temperature."},
+        {"name": "--action_kernel_temperature_start", "type": float, "help": "Initial action kernel temperature for schedule."},
+        {"name": "--action_kernel_temperature_end", "type": float, "help": "Final action kernel temperature for schedule."},
+        {"name": "--action_kernel_temperature_schedule_start", "type": int, "help": "Update at which action temperature schedule starts."},
+        {"name": "--action_kernel_temperature_schedule_end", "type": int, "help": "Update at which action temperature schedule ends."},
+        {"name": "--advantage_temperature", "type": float, "help": "Temperature for positive advantage logits."},
+        {"name": "--advantage_clip", "type": float, "help": "Upper bound for positive advantage weighting."},
+        {"name": "--use_state_kernel", "type": _str_to_bool, "default": None, "help": "Enable or disable state-conditioned kernel."},
+        {"name": "--state_kernel_temperature", "type": float, "help": "Temperature for state-space kernel."},
+        {"name": "--state_feature_mode", "type": str, "help": "State feature mode for the state kernel."},
+        {"name": "--use_multi_temperature", "type": _str_to_bool, "default": None, "help": "Average drift fields from multiple action kernel temperatures."},
+        {"name": "--action_kernel_temperatures", "type": _str_to_float_list, "help": "Comma-separated list of action kernel temperatures."},
+        {"name": "--normalize_drift_field", "type": _str_to_bool, "default": None, "help": "Legacy switch kept for compatibility; current drift logic only uses max-norm clipping."},
+        {"name": "--drift_field_norm_type", "type": str, "help": "Legacy compatibility option; current drift logic does not use field normalization."},
+        {"name": "--log_drift_debug", "type": _str_to_bool, "default": None, "help": "Enable or disable detailed drift debug logging."},
+        {"name": "--entropy_coef", "type": float, "help": "Entropy coefficient for PPO exploration. Overrides config file if provided."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

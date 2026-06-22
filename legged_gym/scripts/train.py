@@ -28,19 +28,43 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
-import numpy as np
-import os
-from datetime import datetime
-
 import isaacgym
 from legged_gym.envs import *
-from legged_gym.utils import get_args, task_registry
-import torch
+from legged_gym.utils import class_to_dict, get_args, task_registry
+from legged_gym.utils.results import RewardCurveCollector, create_results_paths, mirror_terminal_output, save_experiment_metadata
+
 
 def train(args):
-    env, env_cfg = task_registry.make_env(name=args.task, args=args)
-    ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    _, base_train_cfg = task_registry.get_cfgs(name=args.task)
+    algorithm_name = base_train_cfg.runner.algorithm_class_name
+    results_paths = create_results_paths(task_name=args.task, algorithm_name=algorithm_name)
+    reward_collector = RewardCurveCollector()
+
+    with mirror_terminal_output(results_paths.terminal_log_path):
+        print(f"Results directory: {results_paths.root_dir}")
+        print(f"Terminal log file: {results_paths.terminal_log_path}")
+
+        env, _ = task_registry.make_env(name=args.task, args=args)
+        ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
+        save_experiment_metadata(
+            root_dir=results_paths.root_dir,
+            log_dir=ppo_runner.log_dir,
+            metadata={
+                "task": args.task,
+                "args": vars(args),
+                "train_cfg": class_to_dict(train_cfg),
+            },
+        )
+        reward_collector.attach(ppo_runner)
+
+        try:
+            ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+        finally:
+            if reward_collector.save_plot(results_paths.reward_plot_path):
+                print(f"Reward plot saved to: {results_paths.reward_plot_path}")
+            else:
+                print("No reward data was collected, skipping reward plot export.")
+
 
 if __name__ == '__main__':
     args = get_args()

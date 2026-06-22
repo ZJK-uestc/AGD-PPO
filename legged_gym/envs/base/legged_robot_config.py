@@ -213,19 +213,68 @@ class LeggedRobotCfgPPO(BaseConfig):
         # rnn_num_layers = 1
         
     class algorithm:
-        # training params
-        value_loss_coef = 1.0
-        use_clipped_value_loss = True
-        clip_param = 0.2
-        entropy_coef = 0.01
-        num_learning_epochs = 5
-        num_mini_batches = 4 # mini batch size = num_envs*nsteps / nminibatches
-        learning_rate = 1.e-3 #5.e-4
-        schedule = 'adaptive' # could be adaptive, fixed
-        gamma = 0.99
-        lam = 0.95
-        desired_kl = 0.01
-        max_grad_norm = 1.
+        # PPO 基础超参数
+        value_loss_coef = 1.0          # value loss 权重。常用 0.5 / 1.0 / 2.0；太大容易更偏向拟合 value。
+        use_clipped_value_loss = True  # 是否对 value loss 也做 PPO 式 clipping；True 更稳，False 有时更直接。
+        clip_param = 0.2               # PPO policy ratio 裁剪范围。常用 0.1 / 0.2 / 0.3；越大更新越激进。
+        entropy_coef = 0.01           # 熵奖励权重，鼓励探索。常用 0.0 / 0.005 / 0.01 / 0.02。
+        num_learning_epochs = 5        # 每次 rollout 反复学习多少轮。常用 3 / 5 / 8；太大可能过拟合当前 batch。
+        num_mini_batches = 4           # mini-batch 数；单个 mini-batch 大小 = num_envs * nsteps / nminibatches。
+        learning_rate = 1.e-3          # PPO 学习率。常用 3e-4 / 5e-4 / 1e-3；不稳时优先减小。
+        schedule = 'adaptive'          # 学习率策略：'fixed' 固定，'adaptive' 根据 KL 自动调节。
+        gamma = 0.99                   # 折扣因子。常用 0.99 / 0.995 / 0.998；越大越重视长期回报。
+        lam = 0.95                     # GAE(lambda)。常用 0.95 / 0.97 / 0.99；越大方差更高但偏差更小。
+        desired_kl = 0.01              # adaptive schedule 目标 KL。常用 0.005 / 0.01 / 0.02。
+        max_grad_norm = 1.             # PPO 总梯度裁剪上限。常用 0.5 / 1.0 / 2.0。
+
+        # Drifting 总开关
+        use_drift = True               # 是否启用 drifting guidance。baseline PPO 对照实验时设为 False。
+
+        # Drifting 时序与损失
+        drift_model_warmup_updates = 300   # drifting model/guidance 从第几个 update 开始训练或计算。
+        drift_actor_warmup_updates = 400   # drift loss 从第几个 update 开始影响 actor；通常应 >= drift_model_warmup_updates。
+        drift_actor_loss_coef = 0.001      # drift loss 权重。常用 5e-4 / 1e-3 / 5e-3；过大可能压制 PPO 主目标。
+
+        # 正优势样本筛选
+        positive_adv_threshold = 0.0   # 只使用 raw advantage 大于该阈值的样本。Stage 1/2 通常取 0.0。
+        min_positive_samples = 64      # 一个 mini-batch 至少需要多少正样本，否则跳过 drift。常用 16 / 32 / 64。
+        use_top_positive_filter = False # 是否只使用 raw advantage 最高的一部分正样本，减少弱正样本噪声。
+        positive_top_fraction = 0.35   # top-positive 比例；常用 0.25 / 0.35 / 0.5。
+
+        # Drift 场强度与安全限制
+        drift_step_size = 0.1          # actor 朝 drift target 走多大一步。常用 0.05 / 0.1 / 0.2。
+        max_drift_velocity_norm = 1.0  # 单样本 drift field 范数上限；太小会常被裁剪，太大可能不稳定。
+        max_drift_action_dist = 1.5    # drift 后目标动作离当前 actor mean 的最大距离。常用 0.5 / 1.0 / 1.5。
+        drift_chunk_size = 1024        # 分块计算 drift kernel，降低大 batch 下的显存峰值；OOM 时可试 512 / 256。
+        use_residual_drift = False      # 使用 positive action residual = action - old_mu，而不是绝对 action target。
+
+        # Action-space kernel 超参数
+        action_kernel_temperature = 0.3    # 动作距离 softmax 温度。小一些更尖锐，大一些更平滑；常用 0.3 / 0.5 / 1.0。
+        use_temperature_schedule = True    # 是否将 action kernel 温度从较宽逐渐收窄。
+        action_kernel_temperature_start = 0.5
+        action_kernel_temperature_end = 0.3
+        action_kernel_temperature_schedule_start = 400
+        action_kernel_temperature_schedule_end = 1000
+        advantage_temperature = 2.0        # advantage logit 的温度。越小越偏向高 advantage 样本；常用 1.0 / 2.0 / 4.0。
+        advantage_clip = 3.0               # 正优势权重截断上限，防止少量极端样本主导。常用 2.0 / 3.0 / 5.0。
+
+        # State-conditioned kernel 超参数
+        use_state_kernel = False            # 是否把状态距离加入 kernel。Stage 2 推荐 True；做 action-only 对照可设 False。
+        state_kernel_temperature = 0.5     # 状态距离温度。常用 0.5 / 1.0 / 2.0；越小越强调相似状态。
+        state_feature_mode = "obs_norm"    # 状态特征模式：
+                                           # "obs_norm" = 直接对整维 obs 做 batch normalize；
+                                           # "selected" = 只取前一部分观测特征，适合想降低状态核维度时尝试。
+
+        # Multi-temperature kernel
+        use_multi_temperature = False      # 是否同时用多组 action temperature 再平均 drift field。Stage 2 可选增强项。
+        action_kernel_temperatures = [0.3, 0.5, 1.0]  # 多温度列表；常见可试 [0.2, 0.5]、[0.3, 0.5, 1.0]。
+
+        # Drift field 归一化
+        normalize_drift_field = False      # 兼容旧配置保留；当前实现默认只做安全裁剪，不再放大弱 drift field。
+        drift_field_norm_type = "batch"    # 兼容旧配置保留；当前实现中不再使用该开关。
+
+        # 日志开关
+        log_drift_debug = True             # 是否记录更完整的 drift 调试指标。训练调参阶段建议 True。
 
     class runner:
         policy_class_name = 'ActorCritic'

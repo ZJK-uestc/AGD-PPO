@@ -1,0 +1,656 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage[caption=false,font=footnotesize]{subfig}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{bm}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+
+
+\title{Advantage-Guided Drift-Assisted Proximal Policy Optimization for Legged Robot Locomotion
+\thanks{This work was supported by the Major Science and Technology Special Project of Sichuan Province under Grant 2024ZDZX0015. \textsuperscript{*}Corresponding author: Ping Zhang.}
+}
+
+\author{\IEEEauthorblockN{1\textsuperscript{st} Jingkui Zhang}
+\IEEEauthorblockA{\textit{School of Mechanical and Electrical Engineering} \\
+\textit{University of Electronic Science and Technology of China}\\
+Chengdu, China \\
+zjk852060760@163.com}
+\and
+\IEEEauthorblockN{2\textsuperscript{nd} Shenhao Huang}
+\IEEEauthorblockA{\textit{School of Mechanical and Electrical Engineering} \\
+\textit{University of Electronic Science and Technology of China}\\
+Chengdu, China \\
+cionhuang123@gmail.com}
+\and
+\IEEEauthorblockN{3\textsuperscript{rd} Bei Peng}
+\IEEEauthorblockA{\textit{School of Mechanical and Electrical Engineering} \\
+\textit{University of Electronic Science and Technology of China}\\
+Chengdu, China \\
+beipeng@uestc.edu.cn}
+\and
+\IEEEauthorblockN{4\textsuperscript{th} Ping Zhang\textsuperscript{*}}
+\IEEEauthorblockA{\textit{School of Optoelectronic Science and Engineering} \\
+\textit{University of Electronic Science and Technology of China}\\
+Chengdu, China \\
+pingzh@uestc.edu.cn}
+}
+
+
+
+
+\maketitle
+
+
+
+\begin{abstract}
+Legged robot locomotion requires control policies that generate stable, smooth, and adaptive motions under high-dimensional nonlinear dynamics. Reinforcement learning (RL) has become an effective solution to this problem, and Proximal Policy Optimization (PPO) is widely adopted because of its clipped policy update and strong empirical performance. However, PPO mainly adjusts the likelihood of sampled actions according to scalar advantages and does not explicitly model how actions should move toward more favorable regions in continuous action space. To address this limitation, this paper proposes an Advantage-Guided Drift-Assisted PPO (AGD-PPO) method for legged robot locomotion. A lightweight drifting model is introduced to learn local action-space improvement directions from positive-advantage samples, and the resulting drift actions are used as auxiliary supervision for the actor while the original PPO clipped objective is retained. Experiments on ANYmal-C, A1, and Cassie show that AGD-PPO improves the final reward by 8.80\%, 9.65\%, and 17.77\%, respectively, while maintaining comparable mean rollout lengths. These results indicate that explicit action-space guidance can improve both learning efficiency and final locomotion performance within a standard PPO framework.
+\end{abstract}
+
+\begin{IEEEkeywords}
+legged robot locomotion, proximal policy optimization, reinforcement learning, drifting model
+\end{IEEEkeywords}
+
+
+\section{Introduction}
+\label{sec:introduction}
+
+Unmanned systems are increasingly expected to operate in complex and uncertain environments, where autonomy, robustness, and safety are essential for reliable deployment. Existing studies have investigated learning-based formation control, reinforcement-learning-based containment control, autonomous navigation, and UAV swarm confrontation for unmanned platforms~\cite{zhou2023adaptive,miao2024optimized,yang2024autonomous,jiao2024uav}. In addition to decision making and motion planning, reliable unmanned operation also depends on robust state estimation and uncertainty handling under non-Gaussian noise, measurement outliers, and complex dynamic disturbances~\cite{zhong2023pseudolinear,zhong2024kalman,zhong2024robust,zhong2025outlier}. Within this broader unmanned-systems context, legged robots are especially important because they can traverse uneven terrain and preserve mobility in scenarios that are difficult for wheeled or aerial platforms. Their contact-rich dynamics, however, make locomotion control highly sensitive to poor action updates, which may lead to unstable footholds, excessive body oscillations, and early falls.
+
+RL has been widely adopted for robot motion control, and PPO has become a representative policy-gradient algorithm for legged locomotion because of its stable clipped update and practical effectiveness~\cite{schulman2017ppo,rudin2022learning}. PPO-based locomotion policies are often trained in simulation and transferred to real robots, showing promising sim-to-real performance in quadruped control~\cite{rudin2022learning}. Recent studies have also explored hierarchical temporal abstraction and option-based decision structures to improve learning efficiency in complex control tasks~\cite{diao2025gatoc}. Despite these advances, PPO still relies primarily on stochastic exploration and advantage-weighted likelihood optimization. A positive advantage increases the probability of a sampled action, whereas a negative advantage suppresses it. This mechanism is effective at the distribution level, but it does not explicitly specify how the current action should move in continuous action space.
+
+This limitation is especially important for legged robot locomotion. Because the action directly affects contact timing, joint torque, foot placement, and body posture, inefficient policy improvement may expose the robot to undesirable intermediate behaviors during training. For example, a policy may obtain a higher short-term return through aggressive motions, yet such motions can also increase the risk of falls or unstable contacts. Therefore, an effective policy update should not only improve accumulated reward, but also provide more structured action-level guidance.
+
+Generative models have recently been introduced into RL to improve policy learning, value estimation, and trajectory generation. MAD3PG models complex state-action value distributions through denoising diffusion models~\cite{mad3pg}, while FlowCritic introduces flow matching into value estimation~\cite{flowcritic}. Value-guided diffusion policy further adopts candidate action selection to improve action generation~\cite{zhong2025value}. In offline RL, goal-conditioned trajectory generation based on flow matching has also been explored for planning~\cite{diao2025goal}. In addition, GenPO investigates generative diffusion policies in on-policy RL~\cite{ding2025genpo}. These studies suggest that generative modeling can provide richer distributional representations than conventional deterministic regression.
+
+Motivated by this trend, we investigate whether a drifting model can provide explicit action-space guidance for PPO. Generative drifting models formulate sample generation as a direct transport process between source and target distributions~\cite{deng2026drifting}. DFP further interprets policy improvement as a one-step generative transport process through Wasserstein gradient flow~\cite{koo2026dfp}. Rather than replacing the policy with a generative actor, the present work uses a lightweight drifting model only as an auxiliary module. For each state, a candidate action is sampled around the current actor mean, and a rollout action with positive advantage is treated as an empirical target. The drifting model learns the velocity that moves the candidate action toward the positive-advantage action, and the resulting drift action is then used as weak supervision for the actor.
+
+Based on this idea, this paper proposes AGD-PPO for legged robot locomotion. The proposed method preserves the original clipped PPO update and introduces an auxiliary actor loss guided by the drifting model. PPO remains the main optimization backbone, while the drifting module provides explicit action-space guidance toward high-advantage regions. This design maintains compatibility with standard PPO-based legged-robot training pipelines and aims to improve learning efficiency without sacrificing locomotion stability.
+
+The main contributions of this paper are summarized as follows:
+\begin{itemize}
+    \item We propose an advantage-guided drift-assisted policy optimization framework that introduces an action-space drifting model into PPO without modifying the original clipped objective.
+    \item We design a positive-advantage drifting objective, where the drifting model learns to move candidate actions around the current policy toward high-advantage actions.
+    \item We evaluate the proposed method on ANYmal-C, A1, and Cassie locomotion tasks, showing improved final rewards and sustained long-horizon locomotion across different robot morphologies.
+\end{itemize}
+
+
+
+\section{Preliminaries}
+\label{sec:preliminaries}
+
+
+\subsection{PPO}
+\label{subsec:ppo_background}
+
+PPO is a representative on-policy actor-critic algorithm widely used in continuous control and legged robot locomotion. It improves the policy using trajectories collected by the old policy while constraining the update magnitude to avoid destructive policy changes. Given a transition $(s_t,a_t,r_t,s_{t+1})$, the return can be estimated as
+\begin{equation}
+\label{eq:return_def}
+    R_t=\sum_{l=0}^{T-t}\gamma^l r_{t+l},
+\end{equation}
+where $\gamma$ is the discount factor. The advantage function measures whether the sampled action performs better than the value baseline:
+\begin{equation}
+\label{eq:advantage_def}
+    A_t=R_t-V_{\psi}(s_t),
+\end{equation}
+where $V_{\psi}$ denotes the value function. In practical PPO implementations, generalized advantage estimation is often adopted:
+\begin{equation}
+\label{eq:gae_def}
+    A_t=\sum_{l=0}^{T-t}(\gamma\lambda)^l \delta_{t+l},
+    \quad
+    \delta_t=r_t+\gamma V_{\psi}(s_{t+1})-V_{\psi}(s_t),
+\end{equation}
+where $\lambda$ controls the bias-variance trade-off.
+
+PPO updates the actor according to the probability ratio between the current policy and the behavior policy:
+\begin{equation}
+\label{eq:ppo_ratio_intro}
+    r_t(\theta)=
+    \frac{\pi_{\theta}(a_t|s_t)}
+    {\pi_{\theta_{\mathrm{old}}}(a_t|s_t)}.
+\end{equation}
+To prevent excessively large policy updates, PPO clips this ratio and optimizes the following surrogate objective:
+\begin{equation}
+\label{eq:ppo_clip_intro}
+    \mathcal{L}_{\mathrm{clip}}(\theta)
+    =
+    -\mathbb{E}_{t}
+    \left[
+    \min
+    \left(
+    r_t(\theta)A_t,
+    \operatorname{clip}(r_t(\theta),1-\epsilon,1+\epsilon)A_t
+    \right)
+    \right],
+\end{equation}
+where $\epsilon$ is the clipping threshold. The critic is trained by minimizing the value regression loss:
+\begin{equation}
+\label{eq:value_loss_intro}
+    \mathcal{L}_{\mathrm{value}}(\psi)
+    =
+    \mathbb{E}_{t}
+    \left[
+    \left(
+    V_{\psi}(s_t)-R_t
+    \right)^2
+    \right].
+\end{equation}
+Together with an entropy regularization term, the standard PPO objective can be written as
+\begin{equation}
+\label{eq:ppo_total_intro}
+    \mathcal{L}_{\mathrm{PPO}}
+    =
+    \mathcal{L}_{\mathrm{clip}}
+    +
+    c_v\mathcal{L}_{\mathrm{value}}
+    -
+    c_e\mathcal{H}(\pi_{\theta}),
+\end{equation}
+where $c_v$ and $c_e$ are the value loss coefficient and entropy coefficient, respectively.
+
+Although PPO has shown strong empirical performance in legged locomotion, its policy improvement mechanism is still implicit in the continuous action space. Specifically, a positive advantage increases the likelihood of the sampled action, while a negative advantage suppresses it:
+\begin{equation}
+\label{eq:ppo_adv_likelihood}
+    A_t>0 \Rightarrow \uparrow \pi_{\theta}(a_t|s_t),
+    \quad
+    A_t<0 \Rightarrow \downarrow \pi_{\theta}(a_t|s_t).
+\end{equation}
+However, this likelihood-based update does not explicitly indicate how the current action mean $\mu_{\theta}(s_t)$ should move toward a safer or higher-advantage action region. For high-dimensional legged robot control, such an implicit update may lead to inefficient exploration, unstable intermediate policies, and unsafe behaviors such as falls or excessive body oscillations during training. This limitation motivates the introduction of an auxiliary drifting model, which provides explicit action-space improvement guidance while keeping the original PPO clipped objective unchanged.
+
+
+
+\subsection{Generative Drifting Model}
+\label{subsec:generative_drifting_model}
+
+Generative drifting models provide a direct sample-transport perspective for generative modeling. Let $p_{\mathrm{s}}(x)$ and $p_{\mathrm{t}}(x)$ denote the source and target distributions, respectively. The objective of a drifting model is to learn a vector field that transports a source sample $x_{\mathrm{s}}\sim p_{\mathrm{s}}$ toward the target distribution $p_{\mathrm{t}}$. A common way to construct the transport path is to interpolate between a source sample $x_{\mathrm{s}}$ and a target sample $x_{\mathrm{t}}$ as
+\begin{equation}
+\label{eq:drift_interpolation}
+    x_{\tau}=(1-\tau)x_{\mathrm{s}}+\tau x_{\mathrm{t}},
+    \quad \tau \sim \mathcal{U}(0,1),
+\end{equation}
+where $\tau$ denotes the interpolation time. The corresponding target velocity along this path can be written as
+\begin{equation}
+\label{eq:drift_target_velocity}
+    v^{*}=x_{\mathrm{t}}-x_{\mathrm{s}}.
+\end{equation}
+A parameterized drifting model $D_{\phi}$ is then trained to approximate this transport velocity:
+\begin{equation}
+\label{eq:drift_velocity_field}
+    D_{\phi}(x_{\tau},\tau) \approx v^{*}.
+\end{equation}
+The basic drifting objective can be formulated as
+\begin{equation}
+\label{eq:drift_basic_loss}
+    \mathcal{L}_{\mathrm{drift}}(\phi)
+    =
+    \mathbb{E}_{x_{\mathrm{s}},x_{\mathrm{t}},\tau}
+    \left[
+    \left\|
+    D_{\phi}(x_{\tau},\tau)
+    -
+    \operatorname{sg}(x_{\mathrm{t}}-x_{\mathrm{s}})
+    \right\|_2^2
+    \right],
+\end{equation}
+where $\operatorname{sg}(\cdot)$ denotes the stop-gradient operation. After training, a source sample can drift toward the target distribution through a single-step displacement.
+\begin{equation}
+\label{eq:drift_sample_update}
+    \tilde{x}
+    =
+    x_{\mathrm{s}}
+    +
+    \eta D_{\phi}(x_{\mathrm{s}},0),
+\end{equation}
+where $\eta$ is the drift step size.
+
+
+\section{Method}
+\subsection{Advantage-Guided Drift-Assisted PPO}
+\label{subsec:agd_ppo_method}
+
+Based on the PPO formulation in Sec.~\ref{subsec:ppo_background} and the drifting model introduced in Sec.~\ref{subsec:generative_drifting_model}, we develop AGD-PPO for legged robot locomotion control. The key idea is to preserve the original clipped PPO update while introducing a lightweight drifting model that provides explicit action-space improvement guidance. Rather than replacing the stochastic policy with a generative policy, the drifting model is used only as an auxiliary module. It learns how candidate actions around the current actor mean should move toward positive-advantage rollout actions.
+
+Given a PPO minibatch $\mathcal{B}$, the positive-advantage sample set is defined as
+\begin{equation}
+\label{eq:agdp_positive_set}
+    \mathcal{B}^{+}
+    =
+    \left\{
+    (s_i,a_i,A_i)
+    \mid
+    (s_i,a_i,A_i)\in\mathcal{B},\; A_i>0
+    \right\}.
+\end{equation}
+Here, $a_i$ denotes the rollout action sampled by the behavior policy, and $A_i$ is the corresponding advantage estimate. A positive advantage indicates that the sampled action performs better than the value baseline. To emphasize more informative positive samples, an advantage-based weight is assigned to each sample:
+\begin{equation}
+\label{eq:agdp_adv_weight}
+    w_i
+    =
+    \frac{
+    \max(A_i,0)
+    }{
+    \frac{1}{|\mathcal{B}^{+}|}
+    \sum_{j\in\mathcal{B}^{+}}\max(A_j,0)
+    +
+    \varepsilon
+    },
+\end{equation}
+where $\varepsilon$ is a small constant for numerical stability. This normalization keeps the average weight close to one and prevents the drift loss scale from changing drastically across minibatches.
+
+For each positive sample, a candidate action is generated around the current actor mean:
+\begin{equation}
+\label{eq:agdp_candidate_action}
+    b_i
+    =
+    \operatorname{sg}
+    \left(
+    \mu_{\theta}(s_i)
+    \right)
+    +
+    \sigma_d \epsilon_i,
+    \quad
+    \epsilon_i\sim\mathcal{N}(0,I),
+\end{equation}
+where $\mu_{\theta}(s_i)$ is the mean action of the Gaussian actor, $\sigma_d$ is the drift noise scale, and $\operatorname{sg}(\cdot)$ denotes the stop-gradient operation. The stop-gradient operation ensures that the candidate action used for drifting model training does not update the actor parameters. Following the sample-transport view of drifting models, an interpolated action path is constructed as
+\begin{equation}
+\label{eq:agdp_drift_path}
+    a_{\tau,i}
+    =
+    (1-\tau)b_i+\tau a_i,
+    \quad
+    \tau\sim\mathcal{U}(0,1),
+\end{equation}
+and the target drift velocity is defined by
+\begin{equation}
+\label{eq:agdp_target_velocity}
+    v_i^{*}
+    =
+    a_i-b_i.
+\end{equation}
+Thus, the drifting model is trained to predict the velocity of action-space that transports the candidate action $b_i$ to the positive-advantage rollout action $a_i$.
+
+\subsection{Advantage-Guided Drifting Model Update}
+\label{subsec:drift_model_update}
+
+The state-conditioned drifting model $D_{\phi}(s,a,\tau)$ takes the state, the interpolated action, and the interpolation time as inputs and outputs a drift velocity. It is optimized using the following weighted regression objective:
+\begin{equation}
+\label{eq:agdp_drift_loss}
+    \mathcal{L}_{\mathrm{drift}}(\phi)
+    =
+    \mathbb{E}_{i\in\mathcal{B}^{+}}
+    \left[
+    w_i
+    \left\|
+    D_{\phi}(s_i,a_{\tau,i},\tau)
+    -
+    \operatorname{sg}
+    \left(
+    v_i^{*}
+    \right)
+    \right\|_2^2
+    \right].
+\end{equation}
+During this update, both the actor and critic are detached, and only the drifting-model parameters $\phi$ are optimized. Therefore, the drift regression loss does not directly modify the PPO actor-critic network. This separation is important because the drifting model is intended to provide auxiliary action-space guidance rather than replace the original PPO optimization objective.
+
+\subsection{Drift-Assisted Actor Update}
+\label{subsec:drift_actor_update}
+
+After the drifting model is updated, it is used to generate an auxiliary target action for actor optimization. For each positive sample, another candidate action $\tilde{b}_i$ is sampled using the same form as Eq.~(\ref{eq:agdp_candidate_action}). The drifting model predicts the local improvement direction at the beginning of the drift path:
+\begin{equation}
+\label{eq:agdp_actor_drift_velocity}
+    \tilde{v}_i
+    =
+    D_{\phi}(s_i,\tilde{b}_i,0).
+\end{equation}
+The drift-generated action is then obtained by a single-step action displacement:
+\begin{equation}
+\label{eq:agdp_drift_action}
+    a_i^{\mathrm{drift}}
+    =
+    \operatorname{clip}
+    \left(
+    \tilde{b}_i
+    +
+    \eta \tilde{v}_i,
+    a_{\min},
+    a_{\max}
+    \right),
+\end{equation}
+where $\eta$ is the drift step size, and $a_{\min}$ and $a_{\max}$ denote the lower and upper action bounds, respectively. The generated action $a_i^{\mathrm{drift}}$ is detached from the computational graph and used only as an auxiliary target for the actor.
+
+The drift-assisted actor loss is defined as
+\begin{equation}
+\label{eq:agdp_actor_drift_loss}
+    \mathcal{L}_{\mathrm{actor\text{-}drift}}(\theta)
+    =
+    \mathbb{E}_{i\in\mathcal{B}^{+}}
+    \left[
+    w_i
+    \left\|
+    \mu_{\theta}(s_i)
+    -
+    \operatorname{sg}
+    \left(
+    a_i^{\mathrm{drift}}
+    \right)
+    \right\|_2^2
+    \right].
+\end{equation}
+This objective encourages the actor mean to move toward the drift-generated action. Since the drift action is detached, the gradients of Eq.~(\ref{eq:agdp_actor_drift_loss}) are applied only to the actor parameters. In this way, the actor receives explicit action-space guidance while the original PPO likelihood-based update remains unchanged. To incorporate this auxiliary guidance into PPO, the actor-critic objective is written as
+\begin{equation}
+\label{eq:agdp_total_loss}
+    \mathcal{L}_{\mathrm{total}}
+    =
+    \mathcal{L}_{\mathrm{PPO}}
+    +
+    \lambda_d
+    \mathcal{L}_{\mathrm{actor\text{-}drift}},
+\end{equation}
+where $\lambda_d$ is the drift-loss coefficient. The drifting model and PPO network are updated using separate optimizers, as summarized in Algorithm~\ref{alg:agd_ppo}. In practice, $\lambda_d$ is kept small so that PPO remains the dominant objective.
+
+
+
+\begin{algorithm}[t]
+\caption{Advantage-Guided Drift-Assisted PPO}
+\label{alg:agd_ppo}
+\small
+\begin{algorithmic}[1]
+\Require $\pi_{\theta}$, $V_{\psi}$, $D_{\phi}$, $T$, $\lambda_d$, $\eta$, $\sigma_d$, $N_{\min}$
+\For{$t=0,\ldots,T-1$}
+    \State Collect rollouts with $\pi_{\theta}$ and compute $R_t$, $A_t$
+    \For{each PPO minibatch $\mathcal{B}$}
+        \State Compute $\mathcal{L}_{\mathrm{PPO}}$ by Eq.~(\ref{eq:ppo_total_intro})
+        \State Construct $\mathcal{B}^{+}$ by Eq.~(\ref{eq:agdp_positive_set})
+        \If{$|\mathcal{B}^{+}| \geq N_{\min}$}
+            \State Compute $w_i$ and $b_i$ by Eqs.~(\ref{eq:agdp_adv_weight}) and~(\ref{eq:agdp_candidate_action})
+            \State Construct $a_{\tau,i}$ and $v_i^{*}$ by Eqs.~(\ref{eq:agdp_drift_path}) and~(\ref{eq:agdp_target_velocity})
+            \State Update $D_{\phi}$ by minimizing Eq.~(\ref{eq:agdp_drift_loss})
+            \State Generate $a_i^{\mathrm{drift}}$ by Eqs.~(\ref{eq:agdp_actor_drift_velocity}) and~(\ref{eq:agdp_drift_action})
+            \State Compute $\mathcal{L}_{\mathrm{actor\text{-}drift}}$ by Eq.~(\ref{eq:agdp_actor_drift_loss})
+        \Else
+            \State $\mathcal{L}_{\mathrm{actor\text{-}drift}}\leftarrow 0$
+        \EndIf
+        \State Update $\pi_{\theta}$ and $V_{\psi}$ by minimizing Eq.~(\ref{eq:agdp_total_loss})
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+
+
+
+
+
+\section{Experimental Results}
+\label{sec:experimental_analysis}
+
+\subsection{Experimental Setup}
+\label{subsec:experimental_setup}
+
+The proposed method is evaluated on three legged-robot locomotion tasks in LeggedGym~\cite{rudin2022learning}: ANYmal-C, A1, and Cassie. These platforms represent different robot morphologies and control characteristics. ANYmal-C is a medium-sized quadruped with relatively strong actuation and robust terrain adaptation capability. A1 is a lightweight quadruped commonly used to evaluate agile locomotion policies under limited body size and actuation capacity. Cassie is a bipedal robot with more demanding balance requirements because of its underactuated leg structure and narrower support region. Consequently, these three tasks provide a diverse evaluation suite for examining whether AGD-PPO can improve policy learning across different locomotion systems.
+
+For a fair comparison, PPO and AGD-PPO are trained under the same reward functions, network architecture, random seeds, and simulation settings. Each experiment is repeated with five random seeds. The number of parallel environments is set to 4096, and each run is trained for 1500 iterations. The main hyperparameters of the drifting module are summarized in Table~\ref{tab:hyperparameters}.
+
+
+
+\begin{figure*}[t]
+\centering
+\subfloat[ANYmal-C]{
+\begin{minipage}[c]{0.30\textwidth}
+    \centering
+    \includegraphics[width=\linewidth,height=0.13\textheight]{figures/anymal_c.jpeg}
+\end{minipage}
+\label{fig:anymal_c_robot}
+}
+\hfill
+\subfloat[A1]{
+\begin{minipage}[c]{0.30\textwidth}
+    \centering
+    \includegraphics[width=\linewidth,height=0.13\textheight]{figures/a1.png}
+\end{minipage}
+\label{fig:a1_robot}
+}
+\hfill
+\subfloat[Cassie]{
+\begin{minipage}[c]{0.30\textwidth}
+    \centering
+    \includegraphics[width=\linewidth,height=0.13\textheight]{figures/cassie.png}
+\end{minipage}
+\label{fig:cassie_robot}
+}
+\caption{Illustration of the legged robot platforms used in the experiments, including ANYmal-C, A1, and Cassie.}
+\label{fig:robot_platforms}
+\end{figure*}
+
+
+
+
+
+\begin{table}[t]
+\centering
+\caption{Main hyperparameters used in AGD-PPO.}
+\label{tab:hyperparameters}
+\begin{tabular}{lc}
+\hline
+Hyperparameter & Value \\
+\hline
+Number of environments & 4096 \\
+Maximum iterations & 1500 \\
+Drift actor loss coefficient & 0.001 \\
+Drift model learning rate & $1\times10^{-4}$ \\
+Drift noise standard deviation & 0.1 \\
+Drift step size & 0.2 \\
+Drift warmup updates & 300 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Training Curves and Quantitative Results}
+\label{subsec:results_analysis}
+
+The training reward curves are shown in Fig.~\ref{fig:training_curves}. The curves are averaged over five random seeds, and the shaded bands denote the per-iteration population standard deviation across seeds. Compared with the PPO baseline, AGD-PPO generally exhibits faster reward growth and higher final returns. This suggests that the drifting model provides effective action-space guidance and helps the actor move toward positive-advantage regions more efficiently. Because the original clipped objective is preserved, the auxiliary drifting update improves policy learning without replacing the standard PPO optimization mechanism.
+
+
+\begin{figure*}[t]
+\centering
+\subfloat[ANYmal-C]{
+    \includegraphics[width=0.31\textwidth]{figures/anymal_c_rough_reward.png}
+    \label{fig:anymal_c_curve}
+}
+\hfill
+\subfloat[A1]{
+    \includegraphics[width=0.31\textwidth]{figures/a1_rough_reward.png}
+    \label{fig:a1_curve}
+}
+\hfill
+\subfloat[Cassie]{
+    \includegraphics[width=0.31\textwidth]{figures/cassie_reward.png}
+    \label{fig:cassie_curve}
+}
+\caption{Training reward curves of PPO and AGD-PPO on ANYmal-C, A1, and Cassie locomotion tasks. The curves are averaged over five random seeds.}
+\label{fig:training_curves}
+\end{figure*}
+
+
+
+\begin{table}[t]
+\centering
+\caption{Performance comparison on legged-robot locomotion tasks.}
+\label{tab:evaluation_results}
+\begin{tabular}{llcc}
+\hline
+Task & Method & Reward & Mean Rollout Length \\
+\hline
+ANYmal-C & PPO     & $17.250\pm0.133$ & $962.882\pm3.088$ \\
+ANYmal-C & AGD-PPO & $\bm{18.768\pm0.279}$ & $950.454\pm6.215$ \\
+\hline
+A1 & PPO     & $13.719\pm0.571$ & $952.434\pm5.079$  \\
+A1 & AGD-PPO & $\bm{15.043\pm0.198}$ & $960.397\pm6.275$ \\
+\hline
+Cassie & PPO     & $25.101\pm1.388$ & $986.393\pm4.631$ \\
+Cassie & AGD-PPO & $\bm{29.562\pm0.718}$ & $982.525\pm1.805$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\caption{Reward-based stability and tracking proxies averaged over the last 50 iterations. The same five-seed groups as in Fig.~\ref{fig:training_curves} are used. For the three penalty metrics, values closer to zero indicate better performance; for the tracking reward, larger values indicate better performance.}
+\label{tab:safety_metrics}
+\begin{tabular}{llcccc}
+\hline
+Task & Method & Contact Safety Penalty & Vertical Motion Penalty & Joint Acceleration Penalty & Linear Velocity Tracking Reward \\
+\hline
+A1 & PPO & $-0.0346 \pm 0.0054$ & $-0.0620 \pm 0.0040$ & $-0.1454 \pm 0.0061$ & $0.7761 \pm 0.0163$ \\
+A1 & AGD-PPO & $\bm{-0.0276 \pm 0.0020}$ & $\bm{-0.0539 \pm 0.0015}$ & $\bm{-0.1360 \pm 0.0053}$ & $\bm{0.8180 \pm 0.0056}$ \\
+\hline
+ANYmal-C & PPO & $-0.0291 \pm 0.0015$ & $-0.0440 \pm 0.0016$ & $-0.0851 \pm 0.0036$ & $\bm{0.8553 \pm 0.0037}$ \\
+ANYmal-C & AGD-PPO & $\bm{-0.0265 \pm 0.0021}$ & $\bm{-0.0424 \pm 0.0021}$ & $\bm{-0.0659 \pm 0.0034}$ & $0.8420 \pm 0.0056$ \\
+\hline
+Cassie & PPO & $0.0000 \pm 0.0000$ & $-0.0325 \pm 0.0037$ & $-0.1202 \pm 0.0039$ & $0.8266 \pm 0.0124$ \\
+Cassie & AGD-PPO & $0.0000 \pm 0.0000$ & $\bm{-0.0299 \pm 0.0038}$ & $\bm{-0.0664 \pm 0.0035}$ & $\bm{0.8318 \pm 0.0089}$ \\
+\hline
+\end{tabular}
+\end{table*}
+
+
+
+Table~\ref{tab:evaluation_results} reports the quantitative results on the three locomotion tasks. All values are reported as mean$\pm$std over five random seeds. In Table~\ref{tab:evaluation_results}, mean rollout length denotes the average number of simulation steps completed before episode termination. AGD-PPO improves the final reward by $8.80\%$ on ANYmal-C, $9.65\%$ on A1, and $17.77\%$ on Cassie. These gains indicate that the proposed drift-assisted update improves policy quality across both quadruped and bipedal platforms, while the comparable mean rollout lengths suggest that the reward improvements are not obtained by sacrificing long-horizon locomotion.
+
+The training curves in Fig.~\ref{fig:training_curves} further show that AGD-PPO reaches higher reward levels earlier in training on all three robots. This trend suggests that the drift-assisted action targets improve optimization efficiency by guiding the actor more directly toward high-advantage action regions.
+
+To further examine behavior quality, Table~\ref{tab:safety_metrics} reports four reward-based proxies related to stability and tracking. The contact safety penalty reflects undesired body or limb contacts, the vertical motion penalty reflects body oscillation, the joint acceleration penalty reflects motion smoothness, and the linear velocity tracking reward reflects command-following quality. On A1, AGD-PPO improves all four indicators, with gains of $20.15\%$, $13.13\%$, $6.49\%$, and $5.41\%$, respectively. On ANYmal-C, AGD-PPO reduces the three penalty metrics by $8.86\%$, $3.56\%$, and $22.50\%$, while PPO retains a modest $1.56\%$ advantage in tracking reward. On Cassie, both methods achieve the same zero contact penalty, while AGD-PPO reduces the vertical motion penalty by $7.80\%$ and the joint acceleration penalty by $44.80\%$, and improves the tracking reward by $0.63\%$. These results indicate that the proposed method improves not only task reward but also motion safety, smoothness, and command-tracking behavior in most settings.
+
+Taken together, the results suggest that AGD-PPO improves both convergence quality and, in most cases, stability- and tracking-related reward components. The gains are especially notable on Cassie, where the reward margin is the largest and the joint acceleration penalty is substantially reduced. This tendency is consistent with the intuition that explicit action-space guidance is particularly helpful when the locomotion policy must operate within a narrower balance region, as in bipedal control.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper presented AGD-PPO, a PPO-based legged-locomotion method that augments the standard clipped update with a lightweight advantage-guided drifting module. Instead of replacing the policy optimizer, the proposed approach learns local action-space improvement directions from positive-advantage samples and uses the generated drift action as weak actor supervision. In this way, the method preserves the stability of the original PPO framework while providing a more explicit policy-improvement signal in continuous action space.
+
+Experiments on ANYmal-C, A1, and Cassie showed that AGD-PPO consistently improves the final reward over PPO and achieves the largest gain on the bipedal Cassie task. The reward-curve analysis further suggests faster improvement in the early and middle stages of training. The additional reward-based stability and tracking analysis shows that AGD-PPO generally reduces undesired-contact, vertical-motion, and joint-acceleration penalties, while maintaining competitive command-tracking performance. Future work will incorporate explicit tracking-error, fall-rate, and contact-stability metrics, investigate stronger statistical comparisons, and extend the method to real-robot validation in broader unmanned-system scenarios.
+
+
+
+
+\begin{thebibliography}{00}
+
+\bibitem{schulman2017ppo}
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov, 
+``Proximal policy optimization algorithms,'' 
+arXiv preprint arXiv:1707.06347, 2017.
+
+\bibitem{rudin2022learning}
+N. Rudin, D. Hoeller, P. Reist, and M. Hutter, 
+``Learning to walk in minutes using massively parallel deep reinforcement learning,'' 
+in \emph{Proc. 5th Conf. Robot Learning (CoRL)}, 
+vol. 164, pp. 91--100, 2022.
+
+\bibitem{deng2026drifting}
+M. Deng, H. Li, T. Li, Y. Du, and K. He, 
+``Generative modeling via drifting,'' 
+arXiv preprint arXiv:2602.04770, 2026.
+
+\bibitem{zhong2023pseudolinear}
+S. Zhong, B. Peng, L. Ouyang, X. Yang, H. Zhang, and G. Wang, 
+``A pseudolinear maximum correntropy Kalman filter framework for bearings-only target tracking,'' 
+\emph{IEEE Sensors Journal}, 
+vol. 23, no. 17, pp. 19524--19538, 2023.
+
+
+
+\bibitem{zhong2024robust}
+S. Zhong, Z. Wang, G. Wang, Y. Zhou, X. Zhou, and B. Peng, 
+``Robust adaptive filtering based on M-estimation-based minimum error entropy criterion,'' 
+\emph{Information Sciences}, 
+vol. 658, p. 120026, 2024.
+
+\bibitem{diao2025gatoc}
+H. Diao, S. Zhong, J. Chen, J. Zhang, J. He, P. Zhang, G. Wang, Z. Feng, and B. Peng, 
+``GATOC: Learning temporal abstraction with the option transition graph attention mechanism,'' 
+\emph{Expert Systems with Applications}, 
+p. 130071, 2025.
+
+\bibitem{flowcritic}
+S. Zhong, S. Ding, H. Diao, X. Wang, K. C. Teh, and B. Peng, 
+``FlowCritic: Bridging value estimation with flow matching in reinforcement learning,'' 
+arXiv preprint arXiv:2510.22686, 2025.
+
+\bibitem{mad3pg}
+S. Zhong, G. Wang, J. Zhang, X. Wang, K. C. Teh, H. Diao, P. Zhang, J. He, Z. Zeng, T. H. Cheng, \emph{et al.}, 
+``MAD3PG: A framework for multi-agent deep denoising diffusion policy gradient optimization,'' 
+\emph{Information Fusion}, 
+p. 104026, 2025.
+
+\bibitem{diao2025goal}
+H. Diao, J. Zhang, P. Zhang, and B. Peng,
+``Goal-conditioned trajectory generation for planning with flow matching in offline RL,''
+in \emph{Proc. 2025 IEEE International Conference on Unmanned Systems (ICUS)},
+pp. 695--701, 2025.
+
+\bibitem{ding2025genpo}
+S. Ding, K. Hu, S. Zhong, H. Luo, W. Zhang, J. Wang, J. Wang, and Y. Shi,
+``GenPO: Generative diffusion models meet on-policy reinforcement learning,''
+in \emph{Advances in Neural Information Processing Systems (NeurIPS)},
+2025.
+
+\bibitem{zhong2025value}
+S. Zhong, J. Zhang, H. Diao, Z. Feng, K. C. Teh, and B. Peng, 
+``Value-guided diffusion policy with candidate action selection,'' 
+in \emph{Proc. Chinese Conf. Swarm Intelligence and Cooperative Control}, 
+pp. 253--263, 2025.
+
+\bibitem{zhou2023adaptive}
+Q. Zhou, G. Li, R. Tang, Y. Xu, and Q. Shi,
+``Adaptive formation tracking of swarm jumping robots using multiagent deep reinforcement learning,''
+in \emph{Proc. 2023 IEEE International Conference on Unmanned Systems (ICUS)},
+pp. 713--718, 2023.
+
+\bibitem{miao2024optimized}
+G. Miao, Y. Ren, Y. Liu, and Y. Zhao,
+``Optimized containment for multiple unknown nonlinear agents via reinforcement learning,''
+in \emph{Proc. 2024 IEEE International Conference on Unmanned Systems (ICUS)},
+pp. 107--112, 2024.
+
+\bibitem{zhong2024kalman}
+S. Zhong, B. Peng, J. He, Z. Feng, M. Li, and G. Wang, 
+``Kalman filtering based on dynamic perception of measurement noise,'' 
+\emph{Mechanical Systems and Signal Processing}, 
+vol. 213, p. 111343, 2024.
+
+\bibitem{yang2024autonomous}
+R. Yang, Y. Tang, and G. Xiong,
+``Autonomous navigation method based on deep reinforcement learning with dual-layer perception mechanism,''
+in \emph{Proc. 2024 IEEE International Conference on Unmanned Systems (ICUS)},
+pp. 567--572, 2024.
+
+\bibitem{jiao2024uav}
+Y. Jiao, W. Fu, X. Cao, Y. Wang, P. Xu, Y. Wang, L. Yu, and H. Du,
+``UAV swarm confrontation based on multi-agent soft actor-critic method,''
+in \emph{Proc. 2024 IEEE International Conference on Unmanned Systems (ICUS)},
+pp. 878--883, 2024.
+
+\bibitem{zhong2025outlier}
+S. Zhong, B. Peng, Z. Wang, J. He, K. Zhang, and G. Wang, 
+``Outlier-aware recursive instantaneous minimum error entropy algorithm,'' 
+\emph{IEEE Transactions on Systems, Man, and Cybernetics: Systems}, 
+2025.
+
+\bibitem{koo2026dfp}
+J. Koo, M. Park, J. Choi, Y. Min, and M. Sung,
+``Drifting field policy: A one-step generative policy via Wasserstein gradient flow,''
+arXiv preprint arXiv:2605.07727, 2026.
+
+\end{thebibliography}
+
+
+\end{document}

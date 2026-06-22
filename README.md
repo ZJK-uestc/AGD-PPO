@@ -60,6 +60,7 @@ Paper: https://arxiv.org/abs/2109.11978
      - --num_envs NUM_ENVS:  Number of environments to create.
      - --seed SEED:  Random seed.
      - --max_iterations MAX_ITERATIONS:  Maximum number of training iterations.
+     - --use_drift USE_DRIFT:  Enable or disable drifting module with `True` or `False`.
 2. Play a trained policy:  
 ```python legged_gym/scripts/play.py --task=anymal_c_flat```
     - By default, the loaded policy is the last model of the last run of the experiment folder.
