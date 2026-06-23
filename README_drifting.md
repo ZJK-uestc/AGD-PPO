@@ -1,996 +1,267 @@
-方案：Original-style positive-only drifting field** 
+# Drifting 模块说明
+
+本文档总结当前仓库中 AGD-PPO / Drifting 模块的工作原理、目标函数、迭代更新方式和主要超参数。当前实现对应的是 **positive-only drifting field** 版本：它不训练额外的 DriftVelocityNet，也不引入单独的 drift optimizer，而是直接从 PPO mini-batch 中的正优势样本构造动作空间漂移目标。
+
+相关源码位置：
+
+- Drifting 计算模块：`/home/zjk/zjk/rsl_rl/rsl_rl/algorithms/drifting.py`
+- PPO 集成位置：`/home/zjk/zjk/rsl_rl/rsl_rl/algorithms/ppo.py`
+- 默认训练超参数：`legged_gym/envs/base/legged_robot_config.py`
+- 命令行覆盖参数：`legged_gym/utils/helpers.py`
+
+## 1. 核心思想
+
+标准 PPO 通过 advantage 调整采样动作的概率：正 advantage 的动作概率被提高，负 advantage 的动作概率被压低。这个机制是有效的，但它主要作用在概率似然上，并没有显式告诉 actor mean 应该朝动作空间中的哪个方向移动。
+
+Drifting 模块的作用是给 actor 提供一个额外的动作空间引导：
+
+1. 从当前 PPO mini-batch 中选择 raw advantage 大于阈值的正样本。
+2. 根据动作距离、可选状态距离和 advantage 权重，为每个当前 actor mean 找到一组相近且表现较好的正样本动作。
+3. 用这些正样本构造一个 positive drifting field。
+4. 把 actor mean 向该 drifting field 方向移动一小步，得到 stop-gradient 的 drift target。
+5. 用 MSE 辅助损失把当前 actor mean 拉向这个 drift target。
+
+因此，Drifting 并不替代 PPO 的 clipped objective，而是在 PPO loss 外增加一个较小权重的辅助项，使 actor 更新更有方向性。
+
+## 2. 输入与正样本筛选
+
+在每个 PPO mini-batch 中，Drifting 使用以下输入：
+
+- `obs`：当前 mini-batch 的 actor observation。
+- `actions`：rollout 时由旧策略采样并实际执行的动作。
+- `raw_advantages`：当前实现中由 `returns_batch - target_values_batch` 得到。
+- `actor_mean`：当前策略网络对 `obs` 输出的动作均值。
+- `old_action_mean`：rollout 时旧策略的动作均值，用于可选 residual drift。
+
+正样本集合定义为：
 
 ```text
-不再训练 DriftVelocityNet。
-不再使用 tau 路径插值。
-不再计算 pred_velocity 与 target_velocity 的 MSE。
-直接根据当前 PPO batch 中 advantage > 0 的样本计算 positive drifting field V_pos。
-然后构造 stop-gradient drifted target：
-    actor_mean_drifted = stopgrad(actor_mean + drift_step_size * V_pos)
-最后：
-    actor_drift_loss = MSE(actor_mean, actor_mean_drifted)
+B_pos = {i | raw_advantage_i > positive_adv_threshold}
 ```
 
-原始 Drifting Models 的训练伪代码是：先计算 drifting field `V = compute_V(x, y_pos, y_neg)`，再构造 `x_drifted = stopgrad(x + V)`，最后用 `mse_loss(x - x_drifted)` 训练网络输出靠近漂移后的冻结目标；原文也说明这种 stop-gradient 目标避免了直接对分布相关的 (V) 反传。([arXiv][1])
+如果正样本数量小于 `min_positive_samples`，当前 mini-batch 会跳过 drift，返回零 drift loss。若启用 `use_top_positive_filter`，则只保留正样本中 raw advantage 最高的一部分，比例由 `positive_top_fraction` 控制。
 
----
+## 3. Drifting Field 的计算
 
-# Positive-only Original-style Drifting-PPO for legged_gym / rsl_rl
+对每个当前 actor mean `mu_i`，模块根据正样本动作构造一个加权中心或残差方向。
 
-## 1. Goal
+### 3.1 Advantage 权重
 
-本项目在原始 PPO 基础上加入一个 **positive-only drifting field auxiliary loss**。
-
-核心思想：
+正样本 advantage 先截断为非负值，再按均值归一化，最后做上界裁剪：
 
 ```text
-PPO 原始 clipped objective 保持不变。
-Drifting 不再训练单独的 velocity model。
-Drifting 只使用当前 PPO minibatch 中 advantage > 0 的样本。
-Drifting 根据 positive samples 直接计算漂移场 V_pos。
-Actor mean 被推向 stop-gradient 的 drifted target。
-第一版不使用 advantage < 0 的负样本。
+w_j = clamp(max(A_j, 0) / mean(max(A_pos, 0)), 0, advantage_clip)
 ```
 
-总损失形式：
+这个权重会进入 softmax logits，使高 advantage 的正样本更容易影响 drift target。
+
+### 3.2 Action-space kernel
+
+默认情况下，kernel 只基于当前 actor mean 与正样本动作之间的欧氏距离：
 
 ```text
-PPO 原始损失:
-    L_ppo = L_actor + value_loss_coef * L_value - entropy_coef * H
-
-加入 positive-only drifting 后:
-    L_total = L_ppo + drift_actor_loss_coef * L_drift
+logit_ij = -||mu_i - a_j^+|| / T_a + w_j / T_A
+alpha_ij = softmax_j(logit_ij)
 ```
 
 其中：
 
-```text
-L_drift = MSE(actor_mean, stopgrad(actor_mean + drift_step_size * V_pos))
-```
+- `T_a` 是 `action_kernel_temperature`。
+- `T_A` 是 `advantage_temperature`。
+- `alpha_ij` 是当前样本 `i` 对正样本 `j` 的归一化权重。
 
+若启用温度调度，`T_a` 会从 `action_kernel_temperature_start` 线性变化到 `action_kernel_temperature_end`。若启用 multi-temperature，则会对多个 action temperature 分别计算 drifting field，再取平均。
 
----
+### 3.3 State-conditioned kernel
 
-## 2. File Structure
-
-新增文件：
-
-```text
-rsl_rl/rsl_rl/algorithms/drifting.py
-```
-
-保持与 `ppo.py` 同级：
+如果 `use_state_kernel=True`，softmax logits 中会额外加入状态距离项：
 
 ```text
-rsl_rl/rsl_rl/algorithms/
-├── ppo.py
-├── drifting.py
-└── __init__.py
+logit_ij =
+    -||mu_i - a_j^+|| / T_a
+    -||f(s_i) - f(s_j^+)|| / T_s
+    + w_j / T_A
 ```
 
----
+其中 `f(s)` 是 batch-normalized observation feature，`T_s` 是 `state_kernel_temperature`。这个项用于减少“动作相近但状态不相似”的错误匹配。
 
-## 3. Overall Algorithm
+### 3.4 Absolute drift 与 residual drift
 
-```python
-for iteration in range(max_iterations):
+当前实现支持两种构造漂移方向的方式。
 
-    rollout = collect_rollout_with_current_ppo_policy()
-
-    compute_returns_and_advantages(rollout)
-
-    for epoch in ppo_epochs:
-        for batch in rollout.minibatches:
-
-            # 1. PPO 原始损失
-            ppo_loss = compute_ppo_loss(batch)
-
-            # 2. 当前 actor 输出动作均值
-            actor_mean = actor_critic.get_action_mean(batch.obs)
-
-            # 3. positive-only drifting loss
-            if use_drift and iteration >= drift_actor_warmup_updates:
-                drift_loss, drift_logs = drifting.compute_loss(
-                    obs=batch.obs,
-                    actions=batch.actions,
-                    advantages=batch.advantages,
-                    actor_mean=actor_mean
-                )
-            else:
-                drift_loss = 0
-
-            # 4. 总损失
-            total_loss = ppo_loss + drift_actor_loss_coef * drift_loss
-
-            update_actor_critic(total_loss)
-```
-
----
-
-# Stage 1: Minimal Original-style Positive-only Drifting
-
-## 1.1 Goal
-
-第一阶段只实现最小可运行版本：
+默认 absolute drift：
 
 ```text
-1. 新建 drifting.py。
-2. 不实现 DriftVelocityNet。
-3. 不训练 drifting model。
-4. 只使用当前 PPO minibatch 中 advantage > 0 的样本。
-5. 直接计算 positive drifting field V_pos。
-6. 构造 stop-gradient drifted target。
-7. PPO total loss 中加入 drift_actor_loss。
-8. warmup 暂定为 300。
-9. 暂时不使用负样本。
-10. 暂时不使用 state-conditioned kernel，只用 action-space kernel。
+c_i = sum_j alpha_ij a_j^+
+v_i = c_i - mu_i
 ```
 
----
-
-## 1.2 Config
-
-在 `legged_robot_config.py` 或具体任务 config 的 `class algorithm` 中新增：
-
-```python
-use_drift = True
-
-drift_actor_warmup_updates = 300
-drift_actor_loss_coef = 0.001
-
-positive_adv_threshold = 0.0
-min_positive_samples = 32
-
-drift_step_size = 0.1
-max_drift_velocity_norm = 1.0
-max_drift_action_dist = 1.5
-
-action_kernel_temperature = 0.5
-advantage_temperature = 2.0
-advantage_clip = 3.0
-
-use_state_kernel = False
-state_kernel_temperature = 1.0
-
-log_drift_debug = True
-```
-
----
-
-## 1.3 drifting.py Structure
-
-文件：
+可选 residual drift：
 
 ```text
-rsl_rl/rsl_rl/algorithms/drifting.py
+r_j = a_j^+ - old_mu_j
+v_i = sum_j alpha_ij r_j
+c_i = mu_i + v_i
 ```
 
-伪代码：
+当 `use_residual_drift=True` 且 `old_action_mean` 可用时，会使用 residual drift。它学习的是“旧策略均值到正样本动作的残差”，通常比直接追逐绝对动作更保守。
 
-```python
-class Drifting:
+## 4. Drift Target 与目标函数
 
-    def __init__(
-        self,
-        positive_adv_threshold,
-        min_positive_samples,
-        drift_step_size,
-        max_drift_velocity_norm,
-        max_drift_action_dist,
-        action_kernel_temperature,
-        advantage_temperature,
-        advantage_clip,
-        use_state_kernel=False,
-        state_kernel_temperature=1.0,
-    ):
-        save_all_config()
-```
-
-本阶段 `Drifting` 不是神经网络，不继承 `nn.Module` 也可以。
-
----
-
-## 1.4 Drifting.compute_loss()
-
-### 核心公式
-
-令：
+得到 drifting field `v_i` 后，模块先做范数裁剪：
 
 ```text
-x_i = actor_mean_i = μθ(s_i)
-positive actions = {a_j | A_j > threshold}
+v_i <- clip_by_norm(v_i, max_drift_velocity_norm)
 ```
 
-positive drifting field：
+然后构造漂移步长：
 
 ```text
-V_pos_i = Σ_j w_ij * (a_j - x_i)
+delta_i = drift_step_size * v_i
+delta_i <- clip_by_norm(delta_i, max_drift_action_dist)
 ```
 
-其中：
+最终 drift target 为：
 
 ```text
-w_ij = softmax(
-    - ||x_i - a_j|| / action_temperature
-    + clipped_adv_j / advantage_temperature
-)
+mu_i^drift = stop_gradient(mu_i + delta_i)
 ```
 
-drifted target：
+注意：当前实现不会把 drift target clamp 到 `[-1, 1]`，只通过 `max_drift_velocity_norm` 和 `max_drift_action_dist` 限制局部漂移幅度。
+
+Drifting 辅助损失为：
 
 ```text
-x_drifted_i = stopgrad(x_i + drift_step_size * V_pos_i)
+L_drift = mean_i ||mu_i - mu_i^drift||_2^2
 ```
 
-drift loss：
+PPO 原始目标保持不变：
 
 ```text
-L_drift = mean(||x_i - x_drifted_i||²)
+L_PPO = L_surrogate + value_loss_coef * L_value - entropy_coef * H
 ```
 
----
-
-### Pseudocode
-
-```python
-def compute_loss(obs, actions, advantages, actor_mean):
-
-    # 1. detach rollout data
-    obs_detached = detach(obs)
-    actions_detached = detach(actions)
-    advantages_detached = detach(advantages)
-
-    # 2. normalize advantage
-    adv = normalize(advantages_detached)
-
-    # 3. select positive samples
-    pos_mask = adv > positive_adv_threshold
-
-    if num_positive_samples < min_positive_samples:
-        return zero_loss, skip_logs
-
-    obs_pos = obs_detached[pos_mask]
-    act_pos = actions_detached[pos_mask]
-    adv_pos = adv[pos_mask]
-
-    # 4. advantage weight logits
-    adv_weight = clamp(adv_pos, min=0, max=advantage_clip)
-
-    # 5. compute action distance
-    # actor_mean: [B, action_dim]
-    # act_pos:    [P, action_dim]
-    action_dist = cdist(actor_mean.detach(), act_pos)
-
-    # 6. kernel logits
-    logits = (
-        - action_dist / action_kernel_temperature
-        + adv_weight.unsqueeze(0) / advantage_temperature
-    )
-
-    # 7. softmax weights over positive samples
-    weights = softmax(logits, dim=-1)
-
-    # 8. positive center
-    center_pos = weights @ act_pos
-
-    # 9. positive drifting field
-    V_pos = center_pos - actor_mean.detach()
-
-    # 10. clip V_pos by norm
-    V_pos = clip_by_norm(V_pos, max_drift_velocity_norm)
-
-    # 11. drifted target
-    actor_mean_drifted = actor_mean.detach() + drift_step_size * V_pos
-    actor_mean_drifted = clip(actor_mean_drifted, -1, 1)
-
-    # 12. limit target distance from current actor mean
-    actor_mean_drifted = limit_distance(
-        source=actor_mean.detach(),
-        target=actor_mean_drifted,
-        max_distance=max_drift_action_dist
-    )
-
-    # 13. original-style stop-gradient target
-    actor_mean_drifted = stopgrad(actor_mean_drifted)
-
-    # 14. drift loss
-    drift_loss_per_sample = mse(actor_mean, actor_mean_drifted)
-    drift_loss = mean(drift_loss_per_sample)
-
-    # 15. logs
-    logs = compute_logs(
-        positive_ratio,
-        drift_loss,
-        V_pos,
-        center_pos,
-        actor_mean,
-        actor_mean_drifted,
-        weights
-    )
-
-    return drift_loss, logs
-```
-
----
-
-## 1.5 PPO.update() Integration
-
-在 `ppo.py` 中：
-
-```python
-for minibatch in generator:
-
-    # 1. 原始 PPO 计算
-    new_log_prob, entropy, value, actor_mean, actor_std = evaluate_actions(batch)
-
-    ratio = exp(new_log_prob - old_log_prob)
-
-    surrogate_loss = compute_clipped_surrogate_loss(ratio, advantages)
-
-    value_loss = compute_value_loss(value, returns)
-
-    ppo_loss = (
-        surrogate_loss
-        + value_loss_coef * value_loss
-        - entropy_coef * entropy
-    )
-
-    # 2. original-style positive-only drifting loss
-    if use_drift and update_counter >= drift_actor_warmup_updates:
-        drift_loss, drift_logs = drifting.compute_loss(
-            obs=obs_batch,
-            actions=actions_batch,
-            advantages=advantages_batch,
-            actor_mean=actor_mean
-        )
-    else:
-        drift_loss = actor_mean.sum() * 0.0
-        drift_logs = empty_drift_logs()
-
-    # 3. total loss
-    total_loss = ppo_loss + drift_actor_loss_coef * drift_loss
-
-    optimizer.zero_grad()
-    total_loss.backward()
-    clip_grad_norm(actor_critic.parameters)
-    optimizer.step()
-```
-
-注意：
+最终优化目标为：
 
 ```text
-不要创建 drift optimizer。
-不要更新任何 drifting model。
-不要把 drift_loss 单独 backward。
-drift_loss 只通过 PPO optimizer 更新 actor。
+L_total = L_PPO + drift_actor_loss_coef * L_drift
 ```
 
----
-
-## 1.6 Stage 1 Test Metrics
-
-TensorBoard 至少输出：
-
-```text
-Drift/loss
-Drift/effective_loss
-Drift/positive_ratio
-Drift/num_positive_samples
-Drift/skip
-Drift/field_norm
-Drift/center_dist
-Drift/action_dist
-Drift/max_weight
-Drift/weight_entropy
-```
-
-其中：
-
-```text
-Drift/effective_loss = drift_actor_loss_coef * Drift/loss
-Drift/field_norm = mean(||V_pos||)
-Drift/center_dist = mean(||center_pos - actor_mean||)
-Drift/action_dist = mean(||actor_mean_drifted - actor_mean||)
-Drift/weight_entropy = softmax 权重熵，用于判断是否只盯着极少数 positive samples
-```
-
----
-
-## 1.7 Stage 1 Acceptance Criteria
-
-第一阶段通过标准：
-
-```text
-1. use_drift = False 时，PPO 训练行为与原始版本一致。
-2. use_drift = True 时，训练能正常启动。
-3. update < 300 时，Drift/loss = 0 或不参与 total loss。
-4. update >= 300 后，Drift/loss 开始出现。
-5. Drift/positive_ratio 不长期为 0。
-6. Drift/loss 不出现 NaN。
-7. Drift/effective_loss 明显小于 PPO surrogate loss。
-8. PPO reward 不应在 warmup 后突然坍塌。
-```
-
-建议阈值：
-
-```text
-Drift/effective_loss < 0.1 * abs(Loss/surrogate_loss)
-
-Drift/action_dist < max_drift_action_dist
-
-Drift/field_norm 不应长期顶到 max_drift_velocity_norm
-
-Drift/weight_entropy 不应过低，否则说明 drift target 只由少数极端样本决定
-```
-
----
-
-# Stage 2: State-conditioned Kernel and Stable Drift Field
-
-## 2.1 Goal
-
-第二阶段增强 positive drifting field 的质量，而不是重新引入 velocity network。
-
-新增：
-
-```text
-1. state-conditioned kernel。
-2. advantage 加权稳定化。
-3. drift field normalization。
-4. multi-temperature kernel 可选。
-5. drift logs 做 batch 平均。
-```
-
----
-
-## 2.2 Additional Config
-
-```python
-use_state_kernel = True
-state_kernel_temperature = 1.0
-state_feature_mode = "obs_norm"
-
-use_multi_temperature = False
-action_kernel_temperatures = [0.3, 0.5, 1.0]
-
-normalize_drift_field = True
-drift_field_norm_type = "batch"
-
-log_drift_debug = True
-```
-
----
-
-## 2.3 State-conditioned Kernel
-
-第一阶段只用动作距离：
-
-```text
-logits = - ||actor_mean_i - act_pos_j|| / T_a + adv_j / T_adv
-```
-
-第二阶段加入状态距离：
-
-```text
-logits =
-    - ||actor_mean_i - act_pos_j|| / T_a
-    - ||f(obs_i) - f(obs_pos_j)|| / T_s
-    + adv_j / T_adv
-```
-
-伪代码：
-
-```python
-def extract_state_feature(obs):
-
-    if state_feature_mode == "obs_norm":
-        feat = normalize_by_batch(obs)
-
-    elif state_feature_mode == "selected":
-        feat = select_low_dim_robot_features(obs)
-        feat = normalize_by_batch(feat)
-
-    return feat
-```
-
-然后：
-
-```python
-feat = extract_state_feature(obs)
-feat_pos = extract_state_feature(obs_pos)
-
-state_dist = cdist(feat.detach(), feat_pos.detach())
-
-logits = (
-    - action_dist / action_kernel_temperature
-    - state_dist / state_kernel_temperature
-    + adv_weight.unsqueeze(0) / advantage_temperature
-)
-```
-
----
-
-## 2.4 Drift Field Normalization
-
-为避免 `V_pos` 过大或长期被 hard clip，增加 batch-level normalization：
-
-```python
-def normalize_drift_field(V_pos):
-
-    if normalize_drift_field:
-        norm_mean = mean(norm(V_pos))
-        V_pos = V_pos / (norm_mean + 1e-8)
-
-    V_pos = clip_by_norm(V_pos, max_drift_velocity_norm)
-
-    return V_pos
-```
-
-注意：
-
-```text
-normalize 不是替代 clip。
-normalize 用来稳定尺度。
-clip 用来做安全上限。
-```
-
----
-
-## 2.5 Multi-temperature Kernel
-
-可选实现：
-
-```python
-def compute_multi_temperature_field(actor_mean, act_pos, adv_pos):
-
-    fields = []
-
-    for T_a in action_kernel_temperatures:
-        logits = (
-            - action_dist / T_a
-            - state_dist / state_kernel_temperature
-            + adv_weight / advantage_temperature
-        )
-
-        weights = softmax(logits, dim=-1)
-        center_pos = weights @ act_pos
-        V_pos = center_pos - actor_mean.detach()
-
-        fields.append(V_pos)
-
-    V_pos = mean(fields)
-
-    return V_pos
-```
-
-第一版 Stage 2 可以先不打开：
-
-```python
-use_multi_temperature = False
-```
-
----
-
-## 2.6 Batch-average Drift Logs
-
-PPO 一次 update 内有多个 minibatch，不要只记录最后一个 minibatch。
-
-伪代码：
-
-```python
-drift_log_sum = {}
-drift_log_count = 0
-
-for minibatch in generator:
-
-    drift_loss, drift_logs = drifting.compute_loss(...)
-
-    for key, value in drift_logs.items():
-        drift_log_sum[key] = drift_log_sum.get(key, 0.0) + float(value)
-
-    drift_log_count += 1
-
-for key in drift_log_sum:
-    drift_log_sum[key] /= max(drift_log_count, 1)
-
-self.last_drift_logs = drift_log_sum
-```
-
----
-
-## 2.7 Stage 2 Test Metrics
-
-新增日志：
-
-```text
-Drift/state_dist
-Drift/action_dist_to_pos
-Drift/field_norm_raw
-Drift/field_norm_normalized
-Drift/field_clip_ratio
-Drift/weight_entropy
-Drift/max_weight
-Drift/min_weight
-Drift/mean_positive_adv
-Drift/max_positive_adv
-```
-
-建议同时记录 PPO 损失：
-
-```text
-Loss/surrogate_loss
-Loss/value_loss
-Loss/entropy
-Loss/total_loss
-Loss/drift_effective_loss
-```
-
----
-
-## 2.8 Stage 2 Acceptance Criteria
-
-第二阶段通过标准：
-
-```text
-1. Drift/loss 不爆炸。
-2. Drift/field_clip_ratio 不应长期接近 1。
-3. Drift/action_dist 不应长期顶到 max_drift_action_dist。
-4. Drift/weight_entropy 不应过低。
-5. warmup=300 后 PPO reward 不应明显低于 baseline。
-6. state kernel 打开后，PPO reward 至少不比 action-only kernel 更差。
-```
-
-建议判断：
-
-```text
-如果 Drift/field_clip_ratio > 0.8：
-    说明 V_pos 经常被裁剪，max_drift_velocity_norm 可能太小或 kernel target 太激进。
-
-如果 Drift/action_dist 长期等于 max_drift_action_dist：
-    说明 drift_step_size 过大或 V_pos 过强。
-
-如果 Drift/weight_entropy 很低：
-    说明 softmax 只关注少量极端正样本，可以提高 action_kernel_temperature 或 advantage_temperature。
-
-如果 warmup 后 PPO reward 断崖下降：
-    降低 drift_actor_loss_coef 或 drift_step_size。
-```
-
----
-
-# Stage 3: Stable Experiment Version
-
-## 3.1 Goal
-
-第三阶段把代码整理成可用于论文实验的稳定版本。
-
-新增：
-
-```text
-1. 完整开关。
-2. 完整日志。
-3. 消融实验配置。
-4. 安全限制。
-5. 多 seed 实验准备。
-6. 与原始 PPO 的可复现对比。
-```
-
-注意：
-
-```text
-由于方案 B 没有 drift model 参数，因此不需要保存 drift_model_state_dict。
-只需要把 drift 配置写入日志或保存到 config。
-```
-
----
-
-## 3.2 Final Config
-
-```python
-# main switch
-use_drift = True
-
-# warmup
-drift_actor_warmup_updates = 300
-
-# loss weight
-drift_actor_loss_coef = 0.001
-
-# positive samples
-positive_adv_threshold = 0.0
-min_positive_samples = 64
-advantage_clip = 3.0
-advantage_temperature = 2.0
-
-# kernel
-use_state_kernel = True
-state_feature_mode = "obs_norm"
-state_kernel_temperature = 1.0
-action_kernel_temperature = 0.5
-
-# optional multi-temperature
-use_multi_temperature = False
-action_kernel_temperatures = [0.3, 0.5, 1.0]
-
-# drift field
-drift_step_size = 0.1
-normalize_drift_field = True
-max_drift_velocity_norm = 1.0
-max_drift_action_dist = 1.5
-
-# debug
-log_drift_debug = True
-```
-
----
-
-## 3.3 Full Logging Metrics
-
-PPO 侧：
-
-```text
-Train/mean_reward
-Train/episode_length
-Loss/surrogate_loss
-Loss/value_loss
-Loss/entropy
-Loss/total_loss
-Loss/learning_rate
-Policy/mean_std
-Policy/approx_kl
-```
-
-Drifting 侧：
-
-```text
-Drift/loss
-Drift/effective_loss
-Drift/positive_ratio
-Drift/num_positive_samples
-Drift/skip
-
-Drift/field_norm
-Drift/field_norm_raw
-Drift/field_norm_normalized
-Drift/field_clip_ratio
-
-Drift/center_dist
-Drift/action_dist
-Drift/action_dist_to_pos
-
-Drift/weight_entropy
-Drift/max_weight
-Drift/min_weight
-
-Drift/mean_positive_adv
-Drift/max_positive_adv
-```
-
-机器人任务侧建议额外记录：
-
-```text
-Task/forward_vel_error
-Task/yaw_vel_error
-Task/fall_rate
-Task/episode_length
-Task/terrain_level
-Task/foot_slip
-Task/torque_mean
-Task/action_rate
-```
-
----
-
-## 3.4 Ablation Settings
-
-### A. PPO Baseline
-
-```python
-use_drift = False
-```
-
-测试目的：
-
-```text
-确认原始 PPO baseline。
-```
-
----
-
-### B. Positive-only Drift, action kernel only
-
-```python
-use_drift = True
-use_state_kernel = False
-drift_actor_loss_coef = 0.001
-drift_step_size = 0.1
-drift_actor_warmup_updates = 300
-```
-
-测试目的：
-
-```text
-验证最基本的 action-space positive drifting 是否有效。
-```
-
----
-
-### C. Positive-only Drift, state-conditioned kernel
-
-```python
-use_drift = True
-use_state_kernel = True
-drift_actor_loss_coef = 0.001
-drift_step_size = 0.1
-drift_actor_warmup_updates = 300
-```
-
-测试目的：
-
-```text
-验证状态条件 kernel 是否减少错误动作匹配。
-```
-
----
-
-### D. Stronger Drift Weight
-
-```python
-use_drift = True
-use_state_kernel = True
-drift_actor_loss_coef = 0.005
-drift_step_size = 0.1
-drift_actor_warmup_updates = 300
-```
-
-测试目的：
-
-```text
-验证更强 drift 权重是否提升收敛或破坏 PPO 稳定性。
-```
-
----
-
-### E. Larger Drift Step
-
-```python
-use_drift = True
-use_state_kernel = True
-drift_actor_loss_coef = 0.001
-drift_step_size = 0.2
-drift_actor_warmup_updates = 300
-```
-
-测试目的：
-
-```text
-验证 drift_step_size 对动作漂移幅度和稳定性的影响。
-```
-
----
-
-### F. Multi-temperature Drift
-
-```python
-use_drift = True
-use_state_kernel = True
-use_multi_temperature = True
-action_kernel_temperatures = [0.3, 0.5, 1.0]
-drift_actor_loss_coef = 0.001
-drift_step_size = 0.1
-```
-
-测试目的：
-
-```text
-验证多温度 kernel 是否提高 drift field 鲁棒性。
-```
-
----
-
-## 3.5 Stage 3 Acceptance Criteria
-
-第三阶段通过标准：
-
-```text
-1. 所有 ablation 都能正常运行。
-2. use_drift=False 时完全退化为原始 PPO。
-3. Positive-only Drift 不出现 reward 断崖下降。
-4. Drift/effective_loss 不主导 PPO loss。
-5. Drift/field_clip_ratio 不长期接近 1。
-6. Drift/action_dist 不长期顶到 max_drift_action_dist。
-7. 至少 3 个 seed 可以稳定复现实验趋势。
-8. state-conditioned kernel 的稳定性应优于 action-only kernel。
-```
-
-建议数值监控：
-
-```text
-Drift/effective_loss < 0.1 * abs(Loss/surrogate_loss)
-
-Drift/action_dist < max_drift_action_dist
-
-Drift/field_clip_ratio < 0.5 更理想
-
-Drift/weight_entropy 不应长期过低
-
-warmup 后 100 个 iteration 内 reward 不应持续下降
-```
-
----
-
-# Implementation Notes for Codex
-
-## Do
-
-```text
-1. drifting 代码必须单独放在 drifting.py。
-2. PPO 原始 loss 不删除。
-3. 不创建 DriftVelocityNet。
-4. 不创建 drift optimizer。
-5. 只计算 positive-only drifting field。
-6. 只把 drift_loss 加入 PPO total loss。
-7. 第一版只使用 advantage > 0 的正样本。
-8. warmup 默认 300。
-9. 所有 drift 指标写入 TensorBoard。
-10. drift logs 在一个 PPO update 内做 batch 平均。
-```
-
----
-
-## Do Not
-
-```text
-1. 不要使用 advantage < 0 的负样本。
-5. 不要让 drifting 与环境交互。
-8. 不要实现 tau 路径插值。
-9. 不要把 drift 写进 PPO 原始 surrogate loss 内部。
-```
-
----
-
-# Test Commands
-
-小规模调试：
+其中 drift target 是 stop-gradient 的，因此 `L_drift` 只会通过当前 actor mean 更新 actor 网络，不会反向传播到正样本动作、旧策略均值或 drifting field 的计算图中。
+
+## 5. 更新与迭代流程
+
+整体训练流程仍然遵循 PPO：
+
+1. 使用当前 actor-critic 与环境交互，收集 rollout。
+2. 根据 rollout 计算 returns 和 advantages。
+3. 将 rollout 切成多个 mini-batch。
+4. 对每个 mini-batch 计算 PPO surrogate loss、value loss 和 entropy loss。
+5. 若启用 `use_drift` 且当前 update 达到 warmup 条件，则计算 `L_drift`。
+6. 用 `L_total` 做一次反向传播，并使用 PPO 原有 optimizer 更新 actor-critic。
+7. 一个 PPO update 内所有 mini-batch 完成后，清空 storage，并将 `update_counter` 加一。
+
+当前实现有两个 warmup：
+
+- `drift_model_warmup_updates`：达到该 update 后才开始计算 drift loss 和 drift logs。
+- `drift_actor_warmup_updates`：达到该 update 后 drift loss 才真正乘以 `drift_actor_loss_coef` 加入总损失。
+
+因为当前版本没有单独 drift model，所以 `drift_model_warmup_updates` 更准确地说是 drift computation/logging 的起始点，而不是额外网络的训练起点。
+
+## 6. 主要超参数
+
+默认设置在 `LeggedRobotCfgPPO.algorithm` 中。
+
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `use_drift` | `True` | 是否启用 Drifting。PPO baseline 应设为 `False`。 |
+| `drift_model_warmup_updates` | `300` | 开始计算 drift 的 update。当前实现没有 drift model，仅作为 drift 计算 warmup。 |
+| `drift_actor_warmup_updates` | `400` | drift loss 开始影响 actor 的 update。 |
+| `drift_actor_loss_coef` | `0.001` | drift loss 在总损失中的权重。 |
+| `positive_adv_threshold` | `0.0` | raw advantage 大于该阈值才作为正样本。 |
+| `min_positive_samples` | `64` | 每个 mini-batch 至少需要的正样本数量，不足则跳过。 |
+| `use_top_positive_filter` | `False` | 是否只使用正样本中 advantage 较高的一部分。 |
+| `positive_top_fraction` | `0.35` | top-positive filter 保留比例。 |
+| `drift_step_size` | `0.1` | 沿 drifting field 移动的步长。 |
+| `max_drift_velocity_norm` | `1.0` | drift field 的最大范数。 |
+| `max_drift_action_dist` | `1.5` | drift target 相对当前 actor mean 的最大距离。 |
+| `drift_chunk_size` | `1024` | 分块计算 kernel，降低显存峰值。 |
+| `use_residual_drift` | `False` | 是否使用 `action - old_mu` 作为正样本残差方向。 |
+| `action_kernel_temperature` | `0.3` | action-space kernel 温度。越小越偏向最近正样本。 |
+| `use_temperature_schedule` | `True` | 是否线性调度 action kernel 温度。 |
+| `action_kernel_temperature_start` | `0.5` | 温度调度起始值。 |
+| `action_kernel_temperature_end` | `0.3` | 温度调度终止值。 |
+| `action_kernel_temperature_schedule_start` | `400` | 温度调度开始 update。 |
+| `action_kernel_temperature_schedule_end` | `1000` | 温度调度结束 update。 |
+| `advantage_temperature` | `2.0` | advantage logits 温度。越小越强调高 advantage 样本。 |
+| `advantage_clip` | `3.0` | advantage 权重上限，防止极端样本主导。 |
+| `use_state_kernel` | `False` | 是否把状态距离加入 kernel。 |
+| `state_kernel_temperature` | `0.5` | state kernel 温度。 |
+| `state_feature_mode` | `"obs_norm"` | 状态特征模式，默认使用 batch-normalized 全观测。 |
+| `use_multi_temperature` | `False` | 是否使用多个 action kernel 温度并平均。 |
+| `action_kernel_temperatures` | `[0.3, 0.5, 1.0]` | multi-temperature 模式下使用的温度列表。 |
+| `normalize_drift_field` | `False` | 旧配置兼容项；当前实现不再放大弱 drift field。 |
+| `drift_field_norm_type` | `"batch"` | 旧配置兼容项；当前实现中不再实际使用。 |
+| `log_drift_debug` | `True` | 是否记录详细 drift 调试指标。 |
+
+## 7. 日志指标
+
+PPO 更新时会对 mini-batch 内的 drift logs 做平均，常用指标包括：
+
+| 指标 | 含义 |
+| --- | --- |
+| `loss` | 原始 drift MSE loss。 |
+| `effective_loss` | `drift_actor_loss_coef * loss`，即实际加入总损失的大小。 |
+| `positive_ratio` | raw advantage 大于阈值的样本比例。 |
+| `num_positive_samples` | mini-batch 中正样本数量。 |
+| `selected_positive_ratio` | top-positive filter 后实际选中样本比例。 |
+| `num_selected_positive_samples` | 实际参与 drift 的正样本数量。 |
+| `skip` | 是否因正样本不足跳过 drift。 |
+| `action_kernel_temperature` | 当前 update 使用的 action kernel 温度。 |
+| `field_norm` | 裁剪后 drift field 的平均范数。 |
+| `field_norm_raw` | 裁剪前 drift field 的平均范数。 |
+| `field_clip_ratio` | drift field 被范数裁剪的样本比例。 |
+| `center_dist` | kernel 正样本中心到当前 actor mean 的距离。 |
+| `action_dist` | 最终 drift delta 的平均范数。 |
+| `state_dist` | state kernel 中的平均状态距离。 |
+| `action_dist_to_pos` | 当前 actor mean 到正样本动作的平均距离。 |
+| `max_weight` / `min_weight` | softmax 权重的最大值和最小值均值。 |
+| `weight_entropy` | softmax 权重熵，用于判断 drift 是否被少数正样本主导。 |
+| `mean_positive_adv` / `max_positive_adv` | 参与 drift 的正样本 advantage 统计。 |
+
+## 8. 调参建议
+
+通常先保证 PPO baseline 正常，再开启 Drifting。若训练不稳定，优先降低：
+
+- `drift_actor_loss_coef`
+- `drift_step_size`
+- `max_drift_action_dist`
+
+若 `field_clip_ratio` 长期很高，说明 drifting field 经常被裁剪，可能需要增大 `max_drift_velocity_norm`，或提高 action/state kernel 温度让权重更平滑。若 `weight_entropy` 长期很低，说明 drift target 由极少数正样本主导，可以提高 `action_kernel_temperature` 或 `advantage_temperature`，也可以关闭过强的 top-positive filter。
+
+一个较保守的启动配置是：
 
 ```bash
-cd /home/zjk/zjk/legged_gym   # 进入 legged_gym 项目目录
+python legged_gym/scripts/train.py \
+  --task a1 \
+  --headless \
+  --use_drift True \
+  --drift_actor_loss_coef 0.001 \
+  --drift_step_size 0.1 \
+  --drift_model_warmup_updates 300 \
+  --drift_actor_warmup_updates 400
 ```
+
+如果显存不足，可以减小：
 
 ```bash
-python legged_gym/scripts/train.py --task a1 --headless --num_envs 256 --max_iterations 50   # 小规模快速检查 drifting 代码是否能跑通
+--drift_chunk_size 512
 ```
 
-正式训练：
+## 9. 与论文表述的对应关系
 
-```bash
-python legged_gym/scripts/train.py --task a1 --headless --num_envs 4096 --max_iterations 1500   # 正式训练 A1，并记录 PPO+Drift 曲线
-```
+论文中可将当前模块概括为一种 advantage-guided drift-assisted PPO。需要注意的是，当前代码实现不是独立训练一个神经网络形式的 drift model，而是直接用当前 PPO mini-batch 的 positive-advantage samples 计算 kernel-weighted drifting field。因此，更准确的实现描述是：
 
-查看日志：
+> The drifting module computes a positive-advantage, kernel-weighted action-space drift target from each PPO mini-batch and applies it as a small stop-gradient auxiliary actor loss.
 
-```bash
-tensorboard --logdir logs   # 打开 TensorBoard 查看 PPO 和 Drifting 指标
-```
-
----
-
-# Final Expected Behavior
-
-最终期望结果：
-
-```text
-PPO 仍然是主训练算法。
-Drifting 不再训练额外速度网络。
-Drifting 直接从当前 PPO batch 中 advantage > 0 的样本计算 positive drifting field。
-Actor mean 被推向 stop-gradient 的 drifted target。
-整个方法不使用负样本，不改变 PPO clipped objective，只提供额外的 positive-only action-space policy guidance。
-```
-
-一句话总结：
-
-```text
-This implementation adds an original-style positive-only drifting field to PPO. It directly computes a kernel-weighted drift field from positive-advantage actions and applies a small auxiliary loss that moves the actor mean toward a stop-gradient drifted target after a warmup period.
-```
-
-[1]: https://arxiv.org/html/2602.04770v1 "Generative Modeling via Drifting"
+这句话既保留了 drifting 的核心思想，也与当前源码实现一致。
